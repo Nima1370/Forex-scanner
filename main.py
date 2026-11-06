@@ -1,172 +1,353 @@
-import requests
-import datetime
+import os
+import json
+import base64
+import urllib.parse
+import urllib.request
+import urllib.error
 
-# ======= تنظیمات =======
-TELEGRAM_TOKEN = "<TOKEN>"
-TELEGRAM_CHAT_ID = "<CHAT_ID>"
-TWELVEDATA_API_KEY = "<TWELVEDATA_API_KEY>"
-SYMBOLS = ["AUD/USD", "GBP/USD"]
-TIMEFRAMES = ["5min", "15min"]
-# =======================
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
-def send_telegram(msg):
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+
+API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
+GITHUB_REPOSITORY = os.environ["GITHUB_REPOSITORY"]
+GITHUB_BRANCH = os.environ.get("GITHUB_REF_NAME", "main")
+
+PAIRS = ["GBP/USD", "AUD/USD"]
+TIMEFRAME = "15min"
+
+STATE_FILE = "scanner_state.json"
+
+
+def request_json(url, data=None, headers=None):
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers=headers or {},
+        method="POST" if data else "GET"
+    )
+
+    with urllib.request.urlopen(req, timeout=25) as response:
+        return json.loads(response.read().decode())
+
+
+def send_telegram(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+    data = urllib.parse.urlencode({
+        "chat_id": CHAT_ID,
+        "text": message
+    }).encode()
+
+    request_json(url, data)
+
+
+def load_state():
+    url = (
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        f"/contents/{STATE_FILE}?ref={GITHUB_BRANCH}"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+
     try:
-        requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print("Telegram error:", e)
+        result = request_json(url, headers=headers)
 
-def get_klines(symbol, interval):
-    url = (f"https://api.twelvedata.com/time_series?"
-           f"symbol={symbol}&interval={interval}&outputsize=150&apikey={TWELVEDATA_API_KEY}")
-    r = requests.get(url, timeout=15).json()
-    if "values" not in r:
-        print(f"Error {symbol} {interval}: {r.get('message', r)}")
-        return []
-    return r["values"][::-1]  # ترتیب زمانی صعودی
+        content = base64.b64decode(
+            result["content"]
+        ).decode()
 
-def calc_atr(candles, period=14):
-    trs = []
-    for i in range(1, len(candles)):
-        h = float(candles[i]["high"])
-        l = float(candles[i]["low"])
-        pc = float(candles[i-1]["close"])
-        tr = max(h - l, abs(h - pc), abs(l - pc))
-        trs.append(tr)
-    if len(trs) < period:
-        return sum(trs) / len(trs) if trs else 0
-    return sum(trs[-period:]) / period
+        return json.loads(content), result["sha"]
 
-def is_small_body(candle, atr, factor=0.4):
-    body = abs(float(candle["close"]) - float(candle["open"]))
-    return body < atr * factor
+    except urllib.error.HTTPError as error:
+        if error.code == 404:
+            return {}, None
+        raise
 
-def is_sharp_body(candle, atr, factor=1.5):
-    body = abs(float(candle["close"]) - float(candle["open"]))
-    return body > atr * factor
 
-def find_base(candles, atr, start_idx, min_len=2, max_len=5):
-    """پیدا کردن Base: چند کندل کوچک متوالی در یک محدوده باریک"""
-    for length in range(max_len, min_len - 1, -1):
-        if start_idx - length < 0:
-            continue
-        block = candles[start_idx - length:start_idx]
-        if all(is_small_body(c, atr) for c in block):
-            highs = [float(c["high"]) for c in block]
-            lows = [float(c["low"]) for c in block]
-            base_high, base_low = max(highs), min(lows)
-            range_size = base_high - base_low
-            if range_size < atr * 1.2:  # محدوده باریک
-                return {
-                    "high": base_high,
-                    "low": base_low,
-                    "start": start_idx - length,
-                    "end": start_idx - 1
-                }
+def save_state(state, sha):
+    url = (
+        f"https://api.github.com/repos/{GITHUB_REPOSITORY}"
+        f"/contents/{STATE_FILE}"
+    )
+
+    content = base64.b64encode(
+        json.dumps(state, ensure_ascii=False).encode()
+    ).decode()
+
+    payload = {
+        "message": "Update forex scanner state",
+        "content": content,
+        "branch": GITHUB_BRANCH
+    }
+
+    if sha:
+        payload["sha"] = sha
+
+    headers = {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json"
+    }
+
+    data = json.dumps(payload).encode()
+
+    request_json(url, data, headers)
+
+
+def get_candles(pair):
+    params = urllib.parse.urlencode({
+        "symbol": pair,
+        "interval": TIMEFRAME,
+        "outputsize": 60,
+        "timezone": "UTC",
+        "apikey": API_KEY
+    })
+
+    url = (
+        "https://api.twelvedata.com/time_series?"
+        + params
+    )
+
+    data = request_json(url)
+
+    if "values" not in data:
+        raise RuntimeError(str(data))
+
+    candles = []
+
+    for candle in reversed(data["values"]):
+        candles.append({
+            "open": float(candle["open"]),
+            "high": float(candle["high"]),
+            "low": float(candle["low"]),
+            "close": float(candle["close"]),
+            "time": candle["datetime"]
+        })
+
+    return candles
+
+
+def get_session(candle_time):
+    dt = datetime.strptime(
+        candle_time,
+        "%Y-%m-%d %H:%M:%S"
+    ).replace(tzinfo=ZoneInfo("UTC"))
+
+    london = dt.astimezone(
+        ZoneInfo("Europe/London")
+    )
+
+    new_york = dt.astimezone(
+        ZoneInfo("America/New_York")
+    )
+
+    if 8 <= london.hour < 17:
+        return "London"
+
+    if 8 <= new_york.hour < 17:
+        return "New York"
+
     return None
 
-def is_fresh_ob(candles, ob_high, ob_low, ob_end_idx, direction):
-    """بررسی اینکه قیمت بعد از OB بهش برنگشته"""
-    for c in candles[ob_end_idx + 1:]:
-        h = float(c["high"])
-        l = float(c["low"])
-        if direction == "Bullish":
-            # OB نزولی (آخرین کندل نزولی) - قیمت نباید بهش برگشته باشه
-            if l <= ob_high:
-                return False
-        else:
-            if h >= ob_low:
-                return False
-    return True
 
-def detect_signal(symbol, interval):
-    candles = get_klines(symbol, interval)
-    if len(candles) < 40:
+def scan(candles):
+    if len(candles) < 30:
         return None
 
-    atr = calc_atr(candles, 14)
-    if atr == 0:
+    # حذف کندل در حال تشکیل
+    closed = candles[:-1]
+
+    if len(closed) < 25:
         return None
 
-    # بررسی ۲۰ کندل آخر
-    for i in range(len(candles) - 20, len(candles) - 3):
-        ob_candle = candles[i]
-        ob_high = float(ob_candle["high"])
-        ob_low = float(ob_candle["low"])
-        ob_open = float(ob_candle["open"])
-        ob_close = float(ob_candle["close"])
-        ob_is_bearish = ob_close < ob_open
-        ob_is_bullish = ob_close > ob_open
+    # سه کندل تشکیل‌دهنده FVG
+    a, b, c = closed[-3:]
 
-        # بررسی Base قبل از OB
-        base = find_base(candles, atr, i)
-        if not base:
-            continue
+    # دو کندل قدرتمند متوالی
+    first = b
+    second = c
 
-        # بررسی حرکت شارپ بعد از OB
-        for j in range(i + 1, min(i + 4, len(candles))):
-            nxt = candles[j]
-            if not is_sharp_body(nxt, atr, 1.5):
-                continue
-            nxt_high = float(nxt["high"])
-            nxt_low = float(nxt["low"])
-            nxt_close = float(nxt["close"])
-            nxt_open = float(nxt["open"])
+    # پنج کندل قبل از تشکیل FVG
+    base = closed[-8:-3]
 
-            # ===== شارپ صعودی: کندل OB نزولی + شکست بالا =====
-            if ob_is_bearish and nxt_close > nxt_open and nxt_high > ob_high:
-                if is_fresh_ob(candles, ob_high, ob_low, j, "Bullish"):
-                    return {
-                        "type": "Bullish",
-                        "symbol": symbol,
-                        "tf": interval,
-                        "ob_high": ob_high,
-                        "ob_low": ob_low,
-                        "base_high": base["high"],
-                        "base_low": base["low"],
-                        "sharp_close": nxt_close,
-                        "atr": atr
-                    }
+    # میانگین محدوده کندل‌های قدیمی‌تر
+    reference = closed[-25:-8]
 
-            # ===== شارپ نزولی: کندل OB صعودی + شکست پایین =====
-            if ob_is_bullish and nxt_close < nxt_open and nxt_low < ob_low:
-                if is_fresh_ob(candles, ob_high, ob_low, j, "Bearish"):
-                    return {
-                        "type": "Bearish",
-                        "symbol": symbol,
-                        "tf": interval,
-                        "ob_high": ob_high,
-                        "ob_low": ob_low,
-                        "base_high": base["high"],
-                        "base_low": base["low"],
-                        "sharp_close": nxt_close,
-                        "atr": atr
-                    }
-    return None
+    if len(reference) < 10:
+        return None
+
+    average_range = sum(
+        x["high"] - x["low"]
+        for x in reference
+    ) / len(reference)
+
+    if average_range <= 0:
+        return None
+
+    def strong(candle):
+        candle_range = candle["high"] - candle["low"]
+
+        if candle_range <= 0:
+            return False
+
+        body = abs(
+            candle["close"] - candle["open"]
+        )
+
+        return (
+            body / candle_range >= 0.65
+            and candle_range >= average_range * 1.20
+        )
+
+    bullish = (
+        first["close"] > first["open"]
+        and second["close"] > second["open"]
+        and strong(first)
+        and strong(second)
+    )
+
+    bearish = (
+        first["close"] < first["open"]
+        and second["close"] < second["open"]
+        and strong(first)
+        and strong(second)
+    )
+
+    if not bullish and not bearish:
+        return None
+
+    base_high = max(x["high"] for x in base)
+    base_low = min(x["low"] for x in base)
+    base_range = base_high - base_low
+
+    # Base فشرده
+    is_base = (
+        base_range <= average_range * 3.5
+        and sum(
+            1 for x in base
+            if x["high"] - x["low"] <= average_range
+        ) >= 3
+    )
+
+    if bullish:
+        direction = "BUY"
+
+        # FVG صعودی
+        if c["low"] <= a["high"]:
+            return None
+
+        fvg_low = a["high"]
+        fvg_high = c["low"]
+
+        # آخرین کندل نزولی قبل از حرکت
+        is_ob = any(
+            x["close"] < x["open"]
+            for x in base
+        )
+
+        # حرکت باید از محدوده بیس عبور کرده باشد
+        breakout = c["close"] > base_high
+
+    else:
+        direction = "SELL"
+
+        # FVG نزولی
+        if c["high"] >= a["low"]:
+            return None
+
+        fvg_low = c["high"]
+        fvg_high = a["low"]
+
+        is_ob = any(
+            x["close"] > x["open"]
+            for x in base
+        )
+
+        breakout = c["close"] < base_low
+
+    if not breakout:
+        return None
+
+    if not is_base and not is_ob:
+        return None
+
+    setup = "Base + Order Block" if is_base and is_ob else (
+        "Base" if is_base else "Order Block"
+    )
+
+    return {
+        "direction": direction,
+        "setup": setup,
+        "fvg_low": fvg_low,
+        "fvg_high": fvg_high,
+        "time": c["time"]
+    }
+
 
 def main():
-    for symbol in SYMBOLS:
-        for tf in TIMEFRAMES:
-            result = detect_signal(symbol, tf)
-            if result:
-                tf_label = "5 دقیقه" if tf == "5min" else "15 دقیقه"
-                emoji = "🟢" if result["type"] == "Bullish" else "🔴"
-                text = (
-                    f"{emoji} *{result['type']} OB + Sharp Move*\n\n"
-                    f"📊 نماد: `{result['symbol']}`\n"
-                    f"⏱ تایم‌فریم: `{tf_label}`\n"
-                    f"📈 نوع OB: `{result['type']}`\n\n"
-                    f"🔺 سقف OB: `{result['ob_high']:.5f}`\n"
-                    f"🔻 کف OB: `{result['ob_low']:.5f}`\n"
-                    f"📦 سقف Base: `{result['base_high']:.5f}`\n"
-                    f"📦 کف Base: `{result['base_low']:.5f}`\n"
-                    f"💰 قیمت شارپ: `{result['sharp_close']:.5f}`\n"
-                    f"📏 ATR: `{result['atr']:.5f}`\n\n"
-                    f"✅ OB تازه (Fresh) شناسایی شد"
-                )
-                send_telegram(text)
-                print(f"Signal sent: {symbol} {tf} {result['type']}")
+    state, state_sha = load_state()
+    updated = False
+
+    for pair in PAIRS:
+        try:
+            candles = get_candles(pair)
+            signal = scan(candles)
+
+            if signal is None:
+                print(pair, "No setup")
+                continue
+
+            session = get_session(signal["time"])
+
+            if session is None:
+                print(pair, "Outside trading sessions")
+                continue
+
+            signal_id = (
+                f"{pair}|{TIMEFRAME}|"
+                f"{signal['time']}|{signal['direction']}"
+            )
+
+            if state.get(pair) == signal_id:
+                print(pair, "Duplicate signal ignored")
+                continue
+
+            message = (
+                "🔥 NEW FOREX SETUP 🔥\n\n"
+                f"Pair: {pair}\n"
+                "Timeframe: M15\n"
+                f"Direction: {signal['direction']}\n"
+                f"Setup: {signal['setup']}\n"
+                "Pattern: 2 Strong Candles + FVG\n"
+                f"FVG Low: {signal['fvg_low']}\n"
+                f"FVG High: {signal['fvg_high']}\n"
+                f"Session: {session}\n"
+                f"Time: {signal['time']} UTC\n\n"
+                "FVG formed. No retest required."
+            )
+
+            send_telegram(message)
+
+            state[pair] = signal_id
+            updated = True
+
+            print(pair, "Telegram alert sent")
+
+        except Exception as error:
+            print(pair, "ERROR:", str(error))
+
+    if updated:
+        save_state(state, state_sha)
+
 
 if __name__ == "__main__":
     main()

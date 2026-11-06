@@ -2,12 +2,16 @@ import os
 import json
 import urllib.parse
 import urllib.request
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 API_KEY = os.environ["TWELVE_DATA_API_KEY"]
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
-PAIRS = ["EUR/USD", "GBP/USD", "AUD/USD"]
+PAIRS = ["AUD/USD", "GBP/USD"]
+TIMEFRAMES = ["5min", "15min"]
+
 
 def send_telegram(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
@@ -19,12 +23,13 @@ def send_telegram(message):
     req = urllib.request.Request(url, data=data)
     urllib.request.urlopen(req, timeout=20)
 
-def get_candles(pair):
+
+def get_candles(pair, interval):
     params = urllib.parse.urlencode({
         "symbol": pair,
-        "interval": "5min",
-        "outputsize": 50,
-        "order": "asc",
+        "interval": interval,
+        "outputsize": 60,
+        "timezone": "UTC",
         "apikey": API_KEY
     })
 
@@ -36,77 +41,156 @@ def get_candles(pair):
     if "values" not in data:
         raise Exception(str(data))
 
-    return [
-        {
+    candles = []
+    for c in reversed(data["values"]):
+        candles.append({
             "open": float(c["open"]),
             "high": float(c["high"]),
             "low": float(c["low"]),
             "close": float(c["close"]),
             "time": c["datetime"]
+        })
+
+    return candles
+
+
+def in_trading_session(candle_time):
+    dt = datetime.strptime(candle_time, "%Y-%m-%d %H:%M:%S")
+    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+
+    london = dt.astimezone(ZoneInfo("Europe/London"))
+    new_york = dt.astimezone(ZoneInfo("America/New_York"))
+
+    london_open = 8 <= london.hour < 17
+    new_york_open = 8 <= new_york.hour < 17
+
+    return london_open or new_york_open
+
+
+def scan(candles):
+    if len(candles) < 15:
+        return None
+
+    # آخرین کندل برای بررسی ورود قیمت به FVG
+    current = candles[-1]
+    history = candles[:-1]
+
+    # جست‌وجوی حرکت شارپ و FVG در کندل‌های اخیر
+    for i in range(len(history) - 2, max(2, len(history) - 12), -1):
+        impulse = history[i]
+
+        candle_range = impulse["high"] - impulse["low"]
+        body = abs(impulse["close"] - impulse["open"])
+
+        if candle_range <= 0:
+            continue
+
+        if body / candle_range < 0.70:
+            continue
+
+        direction = (
+            "BUY" if impulse["close"] > impulse["open"]
+            else "SELL"
+        )
+
+        previous = history[i - 1]
+        following = history[i + 1]
+
+        # تشکیل FVG صعودی
+        if direction == "BUY":
+            if following["low"] <= previous["high"]:
+                continue
+
+            zone_low = previous["high"]
+            zone_high = following["low"]
+
+        # تشکیل FVG نزولی
+        else:
+            if following["high"] >= previous["low"]:
+                continue
+
+            zone_low = following["high"]
+            zone_high = previous["low"]
+
+        # بررسی برگشت قیمت به محدوده FVG
+        touched = (
+            current["low"] <= zone_high
+            and current["high"] >= zone_low
+        )
+
+        if not touched:
+            continue
+
+        # بررسی وجود OB یا Base پیش از حرکت شارپ
+        setup = None
+
+        if direction == "BUY":
+            for c in history[max(0, i - 4):i]:
+                if c["close"] < c["open"]:
+                    setup = "Bullish Order Block"
+                    break
+        else:
+            for c in history[max(0, i - 4):i]:
+                if c["close"] > c["open"]:
+                    setup = "Bearish Order Block"
+                    break
+
+        if setup is None:
+            base = history[max(0, i - 4):i]
+
+            if len(base) >= 2:
+                avg_range = sum(
+                    c["high"] - c["low"] for c in base
+                ) / len(base)
+
+                if avg_range > 0 and candle_range > avg_range * 1.5:
+                    setup = "Base"
+
+        if setup is None:
+            continue
+
+        return {
+            "direction": direction,
+            "setup": setup,
+            "low": zone_low,
+            "high": zone_high,
+            "time": current["time"]
         }
-        for c in data["values"]
-    ]
 
-def scan(pair, candles):
-    if len(candles) < 25:
-        return []
+    return None
 
-    # آخرین کندل ممکن است هنوز بسته نشده باشد.
-    candles = candles[:-1]
-    last = candles[-1]
-    previous = candles[-21:-1]
-
-    resistance = max(c["high"] for c in previous)
-    support = min(c["low"] for c in previous)
-
-    signals = []
-
-    if last["close"] > resistance:
-        signals.append("Bullish BOS")
-
-    if last["close"] < support:
-        signals.append("Bearish BOS")
-
-    candle_range = last["high"] - last["low"]
-    body = abs(last["close"] - last["open"])
-
-    if candle_range > 0 and body / candle_range >= 0.75:
-        direction = "Bullish" if last["close"] > last["open"] else "Bearish"
-        signals.append(direction + " Displacement")
-
-    recent = candles[-6:-1]
-    average_range = sum(
-        c["high"] - c["low"] for c in recent
-    ) / len(recent)
-
-    if average_range > 0 and candle_range < average_range * 0.5:
-        signals.append("Possible Base")
-
-    return signals, last["time"]
 
 def main():
     for pair in PAIRS:
-        try:
-            candles = get_candles(pair)
-            result = scan(pair, candles)
+        for timeframe in TIMEFRAMES:
+            try:
+                candles = get_candles(pair, timeframe)
 
-            if result:
-                signals, candle_time = result
+                signal = scan(candles)
 
-                if signals:
-                    message = (
-                        f"FOREX SCANNER\n"
-                        f"Pair: {pair}\n"
-                        f"Timeframe: M5\n"
-                        f"Time: {candle_time}\n\n"
-                        + "\n".join(signals)
-                    )
-                    send_telegram(message)
+                if not signal:
+                    continue
 
-            print(pair, "checked")
+                if not in_trading_session(signal["time"]):
+                    continue
 
-        except Exception as error:
-            print(pair, "ERROR:", error)
+                message = (
+                    "FOREX SCANNER\n\n"
+                    f"Pair: {pair}\n"
+                    f"Timeframe: {timeframe}\n"
+                    f"Signal: {signal['direction']}\n"
+                    f"Setup: {signal['setup']}\n"
+                    f"FVG: {signal['low']} - {signal['high']}\n"
+                    f"Time: {signal['time']} UTC\n\n"
+                    "Price returned to FVG"
+                )
+
+                send_telegram(message)
+                print("Signal sent:", pair, timeframe)
+
+            except Exception as error:
+                print(pair, timeframe, "ERROR:", error)
+
 
 if __name__ == "__main__":
     main()

@@ -1,196 +1,172 @@
-import os
-import json
-import urllib.parse
-import urllib.request
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import requests
+import datetime
 
-API_KEY = os.environ["TWELVE_DATA_API_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-
-PAIRS = ["AUD/USD", "GBP/USD"]
+# ======= تنظیمات =======
+TELEGRAM_TOKEN = "<TOKEN>"
+TELEGRAM_CHAT_ID = "<CHAT_ID>"
+TWELVEDATA_API_KEY = "<TWELVEDATA_API_KEY>"
+SYMBOLS = ["AUD/USD", "GBP/USD"]
 TIMEFRAMES = ["5min", "15min"]
+# =======================
 
+def send_telegram(msg):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+    try:
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print("Telegram error:", e)
 
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    data = urllib.parse.urlencode({
-        "chat_id": CHAT_ID,
-        "text": message
-    }).encode()
+def get_klines(symbol, interval):
+    url = (f"https://api.twelvedata.com/time_series?"
+           f"symbol={symbol}&interval={interval}&outputsize=150&apikey={TWELVEDATA_API_KEY}")
+    r = requests.get(url, timeout=15).json()
+    if "values" not in r:
+        print(f"Error {symbol} {interval}: {r.get('message', r)}")
+        return []
+    return r["values"][::-1]  # ترتیب زمانی صعودی
 
-    req = urllib.request.Request(url, data=data)
-    urllib.request.urlopen(req, timeout=20)
+def calc_atr(candles, period=14):
+    trs = []
+    for i in range(1, len(candles)):
+        h = float(candles[i]["high"])
+        l = float(candles[i]["low"])
+        pc = float(candles[i-1]["close"])
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        trs.append(tr)
+    if len(trs) < period:
+        return sum(trs) / len(trs) if trs else 0
+    return sum(trs[-period:]) / period
 
+def is_small_body(candle, atr, factor=0.4):
+    body = abs(float(candle["close"]) - float(candle["open"]))
+    return body < atr * factor
 
-def get_candles(pair, interval):
-    params = urllib.parse.urlencode({
-        "symbol": pair,
-        "interval": interval,
-        "outputsize": 60,
-        "timezone": "UTC",
-        "apikey": API_KEY
-    })
+def is_sharp_body(candle, atr, factor=1.5):
+    body = abs(float(candle["close"]) - float(candle["open"]))
+    return body > atr * factor
 
-    url = "https://api.twelvedata.com/time_series?" + params
-
-    with urllib.request.urlopen(url, timeout=20) as response:
-        data = json.loads(response.read())
-
-    if "values" not in data:
-        raise Exception(str(data))
-
-    candles = []
-    for c in reversed(data["values"]):
-        candles.append({
-            "open": float(c["open"]),
-            "high": float(c["high"]),
-            "low": float(c["low"]),
-            "close": float(c["close"]),
-            "time": c["datetime"]
-        })
-
-    return candles
-
-
-def in_trading_session(candle_time):
-    dt = datetime.strptime(candle_time, "%Y-%m-%d %H:%M:%S")
-    dt = dt.replace(tzinfo=ZoneInfo("UTC"))
-
-    london = dt.astimezone(ZoneInfo("Europe/London"))
-    new_york = dt.astimezone(ZoneInfo("America/New_York"))
-
-    london_open = 8 <= london.hour < 17
-    new_york_open = 8 <= new_york.hour < 17
-
-    return london_open or new_york_open
-
-
-def scan(candles):
-    if len(candles) < 15:
-        return None
-
-    # آخرین کندل برای بررسی ورود قیمت به FVG
-    current = candles[-1]
-    history = candles[:-1]
-
-    # جست‌وجوی حرکت شارپ و FVG در کندل‌های اخیر
-    for i in range(len(history) - 2, max(2, len(history) - 12), -1):
-        impulse = history[i]
-
-        candle_range = impulse["high"] - impulse["low"]
-        body = abs(impulse["close"] - impulse["open"])
-
-        if candle_range <= 0:
+def find_base(candles, atr, start_idx, min_len=2, max_len=5):
+    """پیدا کردن Base: چند کندل کوچک متوالی در یک محدوده باریک"""
+    for length in range(max_len, min_len - 1, -1):
+        if start_idx - length < 0:
             continue
-
-        if body / candle_range < 0.70:
-            continue
-
-        direction = (
-            "BUY" if impulse["close"] > impulse["open"]
-            else "SELL"
-        )
-
-        previous = history[i - 1]
-        following = history[i + 1]
-
-        # تشکیل FVG صعودی
-        if direction == "BUY":
-            if following["low"] <= previous["high"]:
-                continue
-
-            zone_low = previous["high"]
-            zone_high = following["low"]
-
-        # تشکیل FVG نزولی
-        else:
-            if following["high"] >= previous["low"]:
-                continue
-
-            zone_low = following["high"]
-            zone_high = previous["low"]
-
-        # بررسی برگشت قیمت به محدوده FVG
-        touched = (
-            current["low"] <= zone_high
-            and current["high"] >= zone_low
-        )
-
-        if not touched:
-            continue
-
-        # بررسی وجود OB یا Base پیش از حرکت شارپ
-        setup = None
-
-        if direction == "BUY":
-            for c in history[max(0, i - 4):i]:
-                if c["close"] < c["open"]:
-                    setup = "Bullish Order Block"
-                    break
-        else:
-            for c in history[max(0, i - 4):i]:
-                if c["close"] > c["open"]:
-                    setup = "Bearish Order Block"
-                    break
-
-        if setup is None:
-            base = history[max(0, i - 4):i]
-
-            if len(base) >= 2:
-                avg_range = sum(
-                    c["high"] - c["low"] for c in base
-                ) / len(base)
-
-                if avg_range > 0 and candle_range > avg_range * 1.5:
-                    setup = "Base"
-
-        if setup is None:
-            continue
-
-        return {
-            "direction": direction,
-            "setup": setup,
-            "low": zone_low,
-            "high": zone_high,
-            "time": current["time"]
-        }
-
+        block = candles[start_idx - length:start_idx]
+        if all(is_small_body(c, atr) for c in block):
+            highs = [float(c["high"]) for c in block]
+            lows = [float(c["low"]) for c in block]
+            base_high, base_low = max(highs), min(lows)
+            range_size = base_high - base_low
+            if range_size < atr * 1.2:  # محدوده باریک
+                return {
+                    "high": base_high,
+                    "low": base_low,
+                    "start": start_idx - length,
+                    "end": start_idx - 1
+                }
     return None
 
+def is_fresh_ob(candles, ob_high, ob_low, ob_end_idx, direction):
+    """بررسی اینکه قیمت بعد از OB بهش برنگشته"""
+    for c in candles[ob_end_idx + 1:]:
+        h = float(c["high"])
+        l = float(c["low"])
+        if direction == "Bullish":
+            # OB نزولی (آخرین کندل نزولی) - قیمت نباید بهش برگشته باشه
+            if l <= ob_high:
+                return False
+        else:
+            if h >= ob_low:
+                return False
+    return True
+
+def detect_signal(symbol, interval):
+    candles = get_klines(symbol, interval)
+    if len(candles) < 40:
+        return None
+
+    atr = calc_atr(candles, 14)
+    if atr == 0:
+        return None
+
+    # بررسی ۲۰ کندل آخر
+    for i in range(len(candles) - 20, len(candles) - 3):
+        ob_candle = candles[i]
+        ob_high = float(ob_candle["high"])
+        ob_low = float(ob_candle["low"])
+        ob_open = float(ob_candle["open"])
+        ob_close = float(ob_candle["close"])
+        ob_is_bearish = ob_close < ob_open
+        ob_is_bullish = ob_close > ob_open
+
+        # بررسی Base قبل از OB
+        base = find_base(candles, atr, i)
+        if not base:
+            continue
+
+        # بررسی حرکت شارپ بعد از OB
+        for j in range(i + 1, min(i + 4, len(candles))):
+            nxt = candles[j]
+            if not is_sharp_body(nxt, atr, 1.5):
+                continue
+            nxt_high = float(nxt["high"])
+            nxt_low = float(nxt["low"])
+            nxt_close = float(nxt["close"])
+            nxt_open = float(nxt["open"])
+
+            # ===== شارپ صعودی: کندل OB نزولی + شکست بالا =====
+            if ob_is_bearish and nxt_close > nxt_open and nxt_high > ob_high:
+                if is_fresh_ob(candles, ob_high, ob_low, j, "Bullish"):
+                    return {
+                        "type": "Bullish",
+                        "symbol": symbol,
+                        "tf": interval,
+                        "ob_high": ob_high,
+                        "ob_low": ob_low,
+                        "base_high": base["high"],
+                        "base_low": base["low"],
+                        "sharp_close": nxt_close,
+                        "atr": atr
+                    }
+
+            # ===== شارپ نزولی: کندل OB صعودی + شکست پایین =====
+            if ob_is_bullish and nxt_close < nxt_open and nxt_low < ob_low:
+                if is_fresh_ob(candles, ob_high, ob_low, j, "Bearish"):
+                    return {
+                        "type": "Bearish",
+                        "symbol": symbol,
+                        "tf": interval,
+                        "ob_high": ob_high,
+                        "ob_low": ob_low,
+                        "base_high": base["high"],
+                        "base_low": base["low"],
+                        "sharp_close": nxt_close,
+                        "atr": atr
+                    }
+    return None
 
 def main():
-    for pair in PAIRS:
-        for timeframe in TIMEFRAMES:
-            try:
-                candles = get_candles(pair, timeframe)
-
-                signal = scan(candles)
-
-                if not signal:
-                    continue
-
-                if not in_trading_session(signal["time"]):
-                    continue
-
-                message = (
-                    "FOREX SCANNER\n\n"
-                    f"Pair: {pair}\n"
-                    f"Timeframe: {timeframe}\n"
-                    f"Signal: {signal['direction']}\n"
-                    f"Setup: {signal['setup']}\n"
-                    f"FVG: {signal['low']} - {signal['high']}\n"
-                    f"Time: {signal['time']} UTC\n\n"
-                    "Price returned to FVG"
+    for symbol in SYMBOLS:
+        for tf in TIMEFRAMES:
+            result = detect_signal(symbol, tf)
+            if result:
+                tf_label = "5 دقیقه" if tf == "5min" else "15 دقیقه"
+                emoji = "🟢" if result["type"] == "Bullish" else "🔴"
+                text = (
+                    f"{emoji} *{result['type']} OB + Sharp Move*\n\n"
+                    f"📊 نماد: `{result['symbol']}`\n"
+                    f"⏱ تایم‌فریم: `{tf_label}`\n"
+                    f"📈 نوع OB: `{result['type']}`\n\n"
+                    f"🔺 سقف OB: `{result['ob_high']:.5f}`\n"
+                    f"🔻 کف OB: `{result['ob_low']:.5f}`\n"
+                    f"📦 سقف Base: `{result['base_high']:.5f}`\n"
+                    f"📦 کف Base: `{result['base_low']:.5f}`\n"
+                    f"💰 قیمت شارپ: `{result['sharp_close']:.5f}`\n"
+                    f"📏 ATR: `{result['atr']:.5f}`\n\n"
+                    f"✅ OB تازه (Fresh) شناسایی شد"
                 )
-
-                send_telegram(message)
-                print("Signal sent:", pair, timeframe)
-
-            except Exception as error:
-                print(pair, timeframe, "ERROR:", error)
-
+                send_telegram(text)
+                print(f"Signal sent: {symbol} {tf} {result['type']}")
 
 if __name__ == "__main__":
     main()
